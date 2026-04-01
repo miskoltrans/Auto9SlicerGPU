@@ -8,6 +8,9 @@ namespace Auto9Slicer
         public int Tolerate = 0;
         public int CenterSize = 2;
         public int Margin = 2;
+        public bool GradientAware = true;
+        public int AlphaThreshold = 0;
+        public int GradientTolerate = 4;
 
         public static SliceOptions Default => new SliceOptions();
     }
