@@ -583,10 +583,10 @@ namespace Auto9Slicer
 				int nominalHeight, int lineStride, int totalLines,
 				bool templateAtStart)
 			{
-				var bruteForce = _cornerMode == CornerMatchMode.ColorFixedHeight ||
+				var bruteForce = _cornerMode == CornerMatchMode.AlphaBruteForce ||
 				                 _cornerMode == CornerMatchMode.ColorBruteForce;
 				var alphaOnly = _cornerMode == CornerMatchMode.AlphaFixedHeight ||
-				                _cornerMode == CornerMatchMode.ColorFixedHeight;
+				                _cornerMode == CornerMatchMode.AlphaBruteForce;
 
 				var bestNormScore = double.MaxValue;
 				var bestPos = templateAtStart ? totalLines - nominalHeight : 0;
