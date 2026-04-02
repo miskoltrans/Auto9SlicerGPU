@@ -91,6 +91,21 @@ namespace Auto9Slicer
 		}
 
 		/// <summary>
+		/// Analyze from raw PNG file path — avoids Unity texture compression artifacts.
+		/// </summary>
+		public static SliceAnalysis AnalyzeFromFile(string assetPath, int margin = 0)
+		{
+			var fullPath = System.IO.Path.Combine(
+				System.IO.Path.GetDirectoryName(UnityEngine.Application.dataPath) ?? "", assetPath);
+			var bytes = System.IO.File.ReadAllBytes(fullPath);
+			var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+			tex.LoadImage(bytes);
+			var result = new Analyzer(tex, margin).Run();
+			Object.DestroyImmediate(tex);
+			return result;
+		}
+
+		/// <summary>
 		/// Auto-detect edge threshold from body rows: compute max derivative per row
 		/// in the middle third, take average * 3 + 1000.
 		/// </summary>
@@ -334,9 +349,7 @@ namespace Auto9Slicer
 					}
 					else if (diff < 0)
 					{
-						// Shrinking
-						if (state == 0)
-							curStart = y - 1; // start a new cavity if we haven't started
+						// Shrinking — cavity started at curStart (0 initially, or after last close→open)
 						state = 2;
 					}
 					// diff == 0 → keep current state
@@ -646,14 +659,12 @@ namespace Auto9Slicer
 				ApplyCrop(analysis.Crop);
 				analysis.CroppedTexture = CreateTexture(_pixels, _width, _height);
 
-				// Pre-pass: check if any corners exist via alpha scan on cropped image
-				// If all 4 corners have fg at the edge from row 0 → no corners → bail
-				var hasCornerBL = AlphaScanHeight(0, _width, 0, 1, -1) > 0;
-				var hasCornerBR = AlphaScanHeight(0, _width, 0, 1, 1) > 0;
-				var hasCornerTL = AlphaScanHeight(0, _width, _height - 1, -1, -1) > 0;
-				var hasCornerTR = AlphaScanHeight(0, _width, _height - 1, -1, 1) > 0;
-				if (!hasCornerBL && !hasCornerBR && !hasCornerTL && !hasCornerTR)
-					return analysis; // no corners — not suitable for 9-slicing
+				// Pre-pass: if all 4 corner pixels are fully opaque → no rounded corners → bail
+				if (_pixels[0].a >= _maxAlpha &&
+				    _pixels[_width - 1].a >= _maxAlpha &&
+				    _pixels[(_height - 1) * _width].a >= _maxAlpha &&
+				    _pixels[(_height - 1) * _width + _width - 1].a >= _maxAlpha)
+					return analysis;
 
 				// Step 2: Analyze both axes (tolerance 0, margin 0)
 				var xDiffs = CalcDiffList(true);
@@ -846,7 +857,7 @@ namespace Auto9Slicer
 				var alphaEndB = AlphaScanHeight(borderA, borderA + borderB, scanLength - 1, -1, 1);
 
 				// Pass 2: Inner edge — luminance derivative scan
-				var (edgeStartA, edgeStartB, edgeEndA, edgeEndB) = EdgeScanBorders(result);
+				var (edgeStartA, edgeStartB, edgeEndA, edgeEndB) = EdgeScanBorders(result, 200);
 
 				// Store debug
 				result.AlphaStartA = alphaStartA;
