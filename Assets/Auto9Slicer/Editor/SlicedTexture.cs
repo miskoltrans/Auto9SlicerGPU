@@ -35,14 +35,6 @@ namespace Auto9Slicer
         public int Top { get; }
     }
 
-    public enum CornerMatchMode
-    {
-        AlphaFixedHeight,    // alpha-only scoring, template height = border width
-        AlphaBruteForce,     // alpha-only scoring, sweep template heights
-        ColorFixedHeight,    // full RGBA scoring, template height = border width
-        ColorBruteForce      // full RGBA scoring, sweep template heights
-    }
-
     public struct CropBounds
     {
         public int XMin, YMin, XMax, YMax;
@@ -72,17 +64,28 @@ namespace Auto9Slicer
         public bool XDominant;
         public Texture2D CroppedTexture;
         public Texture2D CollapsedTexture;
+        public Texture2D LuminanceTexture;
 
-        // Second-axis results (from per-corner template matching)
-        public int SecondAxisStart;  // top (if X dominant) or left (if Y dominant)
-        public int SecondAxisEnd;    // bottom (if X dominant) or right (if Y dominant)
-        public bool DirectionAWon;   // true = start-side was reference
-        public double ScoreA, ScoreALeft, ScoreARight;
-        public double ScoreB, ScoreBLeft, ScoreBRight;
-        public int HeightALeft, HeightARight;  // best template heights for direction A
-        public int HeightBLeft, HeightBRight;  // best template heights for direction B
+        // Collapsed image data for debug score queries
+        public Color32[] CollapsedPixels;
+        public int CollapsedWidth, CollapsedHeight;
+        public byte MaxAlpha;
+
+        // Per-corner second-axis results
+        public int AlphaStartA, AlphaStartB, AlphaEndA, AlphaEndB;   // Pass 1: alpha shape
+        public int EdgeStartA, EdgeStartB, EdgeEndA, EdgeEndB;       // Pass 2: inner edge
+        public int HeightStartA, HeightStartB, HeightEndA, HeightEndB; // Combined (max)
 
         // Final border in Unity order (relative to cropped image)
         public Border FinalBorder;
+
+        /// <summary>
+        /// True if the asset has meaningful corners and can be 9-sliced.
+        /// False if no corners were detected (e.g., a flat bar) — don't cut.
+        /// </summary>
+        public bool IsValid =>
+            Crop.IsValid &&
+            (XAxis.HasCenter || YAxis.HasCenter) &&
+            (HeightStartA > 0 || HeightStartB > 0 || HeightEndA > 0 || HeightEndB > 0);
     }
 }

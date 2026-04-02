@@ -7,7 +7,9 @@ namespace Auto9Slicer
 	{
 		public static SlicedTexture Slice(Texture2D texture, SliceOptions options)
 		{
-			var analysis = Analyze(texture, options.Margin, CornerMatchMode.ColorFixedHeight);
+			var analysis = Analyze(texture, options.Margin);
+			if (!analysis.IsValid)
+				return new SlicedTexture(texture, new Border(0, 0, 0, 0));
 			var cutTexture = CutCenter(analysis, Mathf.Max(1, options.CenterSize));
 			return new SlicedTexture(cutTexture ?? texture, analysis.FinalBorder);
 		}
@@ -83,10 +85,342 @@ namespace Auto9Slicer
 			}
 		}
 
-		public static SliceAnalysis Analyze(Texture2D texture, int margin = 0,
-			CornerMatchMode cornerMode = CornerMatchMode.ColorFixedHeight)
+		public static SliceAnalysis Analyze(Texture2D texture, int margin = 0)
 		{
-			return new Analyzer(texture, margin, cornerMode).Run();
+			return new Analyzer(texture, margin).Run();
+		}
+
+		/// <summary>
+		/// Auto-detect edge threshold from body rows: compute max derivative per row
+		/// in the middle third, take average * 3 + 1000.
+		/// </summary>
+		private static int AutoEdgeThreshold(Color32[] pixels, int w, int h, byte maxAlpha,
+			int colStart, int colEnd)
+		{
+			var midStart = h / 3;
+			var midEnd = 2 * h / 3;
+			long sum = 0;
+			var cnt = 0;
+			var midX = (colStart + colEnd) / 2;
+
+			for (var y = midStart; y < midEnd; y++)
+			{
+				var maxDiff = 0;
+				for (var x = colStart; x < midX - 1; x++)
+				{
+					var pA = pixels[y * w + x];
+					var pB = pixels[y * w + x + 1];
+					if (pA.a < maxAlpha || pB.a < maxAlpha) continue;
+					var diff = Mathf.Abs(
+						(299 * pA.r + 587 * pA.g + 114 * pA.b) -
+						(299 * pB.r + 587 * pB.g + 114 * pB.b));
+					if (diff > maxDiff) maxDiff = diff;
+				}
+				sum += maxDiff;
+				cnt++;
+			}
+
+			return cnt > 0 ? (int)(sum / cnt * 3 + 1000) : 1000;
+		}
+
+		/// <summary>
+		/// For each row, find the first pixel above threshold scanning from the center seam outward.
+		/// </summary>
+		private static void ComputeRowEdges(Color32[] pixels, int w, int h, byte maxAlpha,
+			int colStart, int colEnd, int threshold, int scanOutDir,
+			out int[] edgePos, out int[] edgeStrength)
+		{
+			edgePos = new int[h];
+			edgeStrength = new int[h];
+
+			for (var y = 0; y < h; y++)
+			{
+				edgePos[y] = -1;
+				edgeStrength[y] = 0;
+
+				if (scanOutDir < 0)
+				{
+					for (var x = colEnd - 2; x >= colStart; x--)
+					{
+						var diff = LumDiff(pixels, w, y, x, maxAlpha);
+						if (diff > threshold)
+						{
+							edgePos[y] = x;
+							edgeStrength[y] = diff;
+							break;
+						}
+					}
+				}
+				else
+				{
+					for (var x = colStart; x < colEnd - 1; x++)
+					{
+						var diff = LumDiff(pixels, w, y, x, maxAlpha);
+						if (diff > threshold)
+						{
+							edgePos[y] = x;
+							edgeStrength[y] = diff;
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		private static int LumDiff(Color32[] pixels, int w, int y, int x, byte maxAlpha)
+		{
+			if (x + 1 >= w) return 0;
+			var pA = pixels[y * w + x];
+			var pB = pixels[y * w + x + 1];
+			if (pA.a < maxAlpha || pB.a < maxAlpha) return 0;
+			var lumA = 299 * pA.r + 587 * pA.g + 114 * pA.b;
+			var lumB = 299 * pB.r + 587 * pB.g + 114 * pB.b;
+			return Mathf.Abs(lumA - lumB);
+		}
+
+		/// <summary>
+		/// Generate debug texture showing per-row strongest edge.
+		/// White dot = edge pixel, brightness = edge strength. Red line = detected border.
+		/// </summary>
+		public static Texture2D GenerateEdgeTexture(SliceAnalysis analysis, int edgeThreshold = 0)
+		{
+			if (analysis.CollapsedPixels == null) return null;
+
+			var pixels = analysis.CollapsedPixels;
+			var w = analysis.CollapsedWidth;
+			var h = analysis.CollapsedHeight;
+			var borderA = analysis.XDominant ? analysis.XAxis.BorderStart : analysis.YAxis.BorderStart;
+			var borderB = analysis.XDominant ? analysis.XAxis.BorderEnd : analysis.YAxis.BorderEnd;
+
+			var threshA = edgeThreshold >= 0 ? edgeThreshold : AutoEdgeThreshold(pixels, w, h, analysis.MaxAlpha, 0, borderA);
+			var threshB = edgeThreshold >= 0 ? edgeThreshold : AutoEdgeThreshold(pixels, w, h, analysis.MaxAlpha, borderA, borderA + borderB);
+
+			ComputeRowEdges(pixels, w, h, analysis.MaxAlpha, 0, borderA, threshA, -1,
+				out var posA, out var strA);
+			ComputeRowEdges(pixels, w, h, analysis.MaxAlpha, borderA, borderA + borderB, threshB, 1,
+				out var posB, out var strB);
+
+			// Per-pixel horizontal luminance derivative
+			var outPixels = new Color32[pixels.Length];
+			for (var y = 0; y < h; y++)
+			for (var x = 0; x < w; x++)
+			{
+				var idx = y * w + x;
+				var p = pixels[idx];
+				var diff = LumDiff(pixels, w, y, x, analysis.MaxAlpha);
+
+				if (p.a < analysis.MaxAlpha)
+				{
+					outPixels[idx] = new Color32(0, 0, 0, p.a > 0 ? (byte)30 : (byte)0);
+					continue;
+				}
+
+				var thresh = x < borderA ? threshA : threshB;
+				var b = (byte)Mathf.Clamp(diff * 255 / 30000, 0, 255);
+
+				if (diff > thresh)
+					outPixels[idx] = new Color32(b, b, 0, 255); // yellow = above threshold
+				else
+					outPixels[idx] = new Color32(0, 0, b, 255); // blue = below threshold
+			}
+
+			// Draw cavity boundary lines first (green)
+			var (eBL, eBR, eTL, eTR) = EdgeScanBorders(analysis, edgeThreshold);
+			var bottomLine = Mathf.Max(eBL, eBR);
+			var topLine = Mathf.Max(eTL, eTR);
+
+			if (bottomLine > 0 && bottomLine < h)
+				for (var x = 0; x < w; x++)
+					outPixels[bottomLine * w + x] = new Color32(0, 200, 0, 255);
+
+			if (topLine > 0)
+			{
+				var topRow = h - 1 - topLine;
+				if (topRow >= 0 && topRow < h)
+					for (var x = 0; x < w; x++)
+						outPixels[topRow * w + x] = new Color32(100, 255, 100, 255);
+			}
+
+			// Then red dots on top
+			for (var y = 0; y < h; y++)
+			{
+				if (posA[y] >= 0)
+					outPixels[y * w + posA[y]] = new Color32(255, 0, 0, 255);
+				if (posB[y] >= 0)
+					outPixels[y * w + posB[y]] = new Color32(255, 0, 0, 255);
+			}
+
+			var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+			tex.filterMode = FilterMode.Point;
+			tex.SetPixels32(outPixels);
+			tex.Apply();
+			return tex;
+		}
+
+		/// <summary>
+		/// Edge line scan: for each corner, scan from edge inward.
+		/// Find the last row with a strong edge peak. Border = that row.
+		/// Body rows have weak/no peaks (smooth gradient).
+		/// </summary>
+		public static (int BL, int BR, int TL, int TR) EdgeScanBorders(
+			SliceAnalysis analysis, int edgeThreshold = 0)
+		{
+			if (analysis.CollapsedPixels == null) return (0, 0, 0, 0);
+
+			var pixels = analysis.CollapsedPixels;
+			var w = analysis.CollapsedWidth;
+			var h = analysis.CollapsedHeight;
+			var borderA = analysis.XDominant ? analysis.XAxis.BorderStart : analysis.YAxis.BorderStart;
+			var borderB = analysis.XDominant ? analysis.XAxis.BorderEnd : analysis.YAxis.BorderEnd;
+
+			var threshA = edgeThreshold >= 0 ? edgeThreshold : AutoEdgeThreshold(pixels, w, h, analysis.MaxAlpha, 0, borderA);
+			var threshB = edgeThreshold >= 0 ? edgeThreshold : AutoEdgeThreshold(pixels, w, h, analysis.MaxAlpha, borderA, borderA + borderB);
+
+			// For each side, compute edge distance from seam per row.
+			// Then find the biggest cavity — longest stretch at max distance.
+
+			int[] ComputeEdgeDistances(int colStart, int colEnd, int thresh, int scanOutDir)
+			{
+				var dist = new int[h];
+				for (var y = 0; y < h; y++)
+				{
+					dist[y] = 0;
+					if (scanOutDir < 0)
+					{
+						for (var x = colEnd - 2; x >= colStart; x--)
+						{
+							if (LumDiff(pixels, w, y, x, analysis.MaxAlpha) > thresh)
+							{ dist[y] = colEnd - 1 - x; break; }
+						}
+					}
+					else
+					{
+						for (var x = colStart; x < colEnd - 1; x++)
+						{
+							if (LumDiff(pixels, w, y, x, analysis.MaxAlpha) > thresh)
+							{ dist[y] = x - colStart + 1; break; }
+						}
+					}
+				}
+				return dist;
+			}
+
+			// Find the biggest cavity: longest streak of opening (growing/equal)
+			// then closing (shrinking/equal). Like finding the longest balanced parenthesis.
+			// Returns (bottomBorder, topBorder).
+			(int, int) FindCavity(int[] dist)
+			{
+				// State: 0 = initial, 1 = opening (growing), 2 = closing (shrinking)
+				var bestStart = 0;
+				var bestLen = 0;
+				var curStart = 0;
+				var state = 0; // 0=initial, 1=opening, 2=closing
+
+				for (var y = 1; y < h; y++)
+				{
+					var diff = dist[y] - dist[y - 1];
+
+					if (diff > 0)
+					{
+						// Growing
+						if (state == 2)
+						{
+							// Was closing, now growing again → previous cavity ended
+							var len = y - curStart;
+							if (len > bestLen) { bestLen = len; bestStart = curStart; }
+							curStart = y - 1;
+						}
+						state = 1;
+					}
+					else if (diff < 0)
+					{
+						// Shrinking
+						if (state == 0)
+							curStart = y - 1; // start a new cavity if we haven't started
+						state = 2;
+					}
+					// diff == 0 → keep current state
+				}
+
+				// Final cavity
+				var finalLen = h - curStart;
+				if (finalLen > bestLen) { bestLen = finalLen; bestStart = curStart; }
+
+				if (bestLen <= 1) return (0, 0);
+
+				var cavEnd = bestStart + bestLen;
+
+				// Within the cavity, scan from bottom: last row where dist is still growing
+				var bottomBorder = bestStart;
+				for (var y = bestStart + 1; y < cavEnd; y++)
+				{
+					if (dist[y] > dist[y - 1])
+						bottomBorder = y;
+					else if (dist[y] < dist[y - 1])
+						break;
+				}
+
+				// Within the cavity, scan from top: last row where dist is still growing (from top)
+				var topRow = cavEnd - 1;
+				for (var y = cavEnd - 2; y >= bestStart; y--)
+				{
+					if (dist[y] > dist[y + 1])
+						topRow = y;
+					else if (dist[y] < dist[y + 1])
+						break;
+				}
+				var topBorder = h - 1 - topRow;
+
+				return (bottomBorder, topBorder);
+			}
+
+			var distA = ComputeEdgeDistances(0, borderA, threshA, -1);
+			var distB = ComputeEdgeDistances(borderA, borderA + borderB, threshB, 1);
+
+			var (bottomA, topA) = FindCavity(distA);
+			var (bottomB, topB) = FindCavity(distB);
+
+			return (bottomA, bottomB, topA, topB);
+		}
+
+		public static void LogDistanceProfile(SliceAnalysis analysis, int edgeThreshold = 0)
+		{
+			if (analysis.CollapsedPixels == null) return;
+
+			var pixels = analysis.CollapsedPixels;
+			var w = analysis.CollapsedWidth;
+			var h = analysis.CollapsedHeight;
+			var borderA = analysis.XDominant ? analysis.XAxis.BorderStart : analysis.YAxis.BorderStart;
+			var borderB = analysis.XDominant ? analysis.XAxis.BorderEnd : analysis.YAxis.BorderEnd;
+
+			var threshA = edgeThreshold >= 0 ? edgeThreshold : AutoEdgeThreshold(pixels, w, h, analysis.MaxAlpha, 0, borderA);
+			var threshB = edgeThreshold >= 0 ? edgeThreshold : AutoEdgeThreshold(pixels, w, h, analysis.MaxAlpha, borderA, borderA + borderB);
+
+			var sb = new System.Text.StringBuilder();
+			sb.AppendLine($"Distance Profile (h={h}, borderA={borderA}, borderB={borderB}, threshA={threshA}, threshB={threshB}):");
+
+			for (var y = 0; y < h; y++)
+			{
+				var distA = 0;
+				for (var x = borderA - 2; x >= 0; x--)
+				{
+					if (LumDiff(pixels, w, y, x, analysis.MaxAlpha) > threshA)
+					{ distA = borderA - 1 - x; break; }
+				}
+
+				var distB = 0;
+				for (var x = borderA; x < borderA + borderB - 1; x++)
+				{
+					if (LumDiff(pixels, w, y, x, analysis.MaxAlpha) > threshB)
+					{ distB = x - borderA + 1; break; }
+				}
+
+				var barA = new string('█', distA);
+				var barB = new string('█', distB);
+				sb.AppendLine($"  y={y,3}: A={distA,3} {barA}  |  B={distB,3} {barB}");
+			}
+
+			UnityEngine.Debug.Log(sb.ToString());
 		}
 
 		private class Runner
@@ -279,15 +613,14 @@ namespace Auto9Slicer
 		{
 			private readonly Texture2D _texture;
 			private readonly int _margin;
-			private readonly CornerMatchMode _cornerMode;
 			private Color32[] _pixels;
 			private int _width, _height;
+			private byte _maxAlpha;
 
-			public Analyzer(Texture2D texture, int margin, CornerMatchMode cornerMode)
+			public Analyzer(Texture2D texture, int margin)
 			{
 				_texture = texture;
 				_margin = margin;
-				_cornerMode = cornerMode;
 			}
 
 			public SliceAnalysis Run()
@@ -295,6 +628,10 @@ namespace Auto9Slicer
 				_width = _texture.width;
 				_height = _texture.height;
 				_pixels = _texture.GetPixels32();
+
+				_maxAlpha = 0;
+				for (var i = 0; i < _pixels.Length; i++)
+					if (_pixels[i].a > _maxAlpha) _maxAlpha = _pixels[i].a;
 
 				var analysis = new SliceAnalysis
 				{
@@ -308,6 +645,15 @@ namespace Auto9Slicer
 
 				ApplyCrop(analysis.Crop);
 				analysis.CroppedTexture = CreateTexture(_pixels, _width, _height);
+
+				// Pre-pass: check if any corners exist via alpha scan on cropped image
+				// If all 4 corners have fg at the edge from row 0 → no corners → bail
+				var hasCornerBL = AlphaScanHeight(0, _width, 0, 1, -1) > 0;
+				var hasCornerBR = AlphaScanHeight(0, _width, 0, 1, 1) > 0;
+				var hasCornerTL = AlphaScanHeight(0, _width, _height - 1, -1, -1) > 0;
+				var hasCornerTR = AlphaScanHeight(0, _width, _height - 1, -1, 1) > 0;
+				if (!hasCornerBL && !hasCornerBR && !hasCornerTL && !hasCornerTR)
+					return analysis; // no corners — not suitable for 9-slicing
 
 				// Step 2: Analyze both axes (tolerance 0, margin 0)
 				var xDiffs = CalcDiffList(true);
@@ -331,7 +677,14 @@ namespace Auto9Slicer
 					CollapseY(analysis.YAxis.CenterStart, analysis.YAxis.CenterEnd);
 
 				if (analysis.XAxis.HasCenter || analysis.YAxis.HasCenter)
+				{
 					analysis.CollapsedTexture = CreateTexture(_pixels, _width, _height);
+					analysis.LuminanceTexture = CreateLuminanceTexture(_pixels, _width, _height);
+					analysis.CollapsedPixels = (Color32[])_pixels.Clone();
+					analysis.CollapsedWidth = _width;
+					analysis.CollapsedHeight = _height;
+					analysis.MaxAlpha = _maxAlpha;
+				}
 
 				// Step 4: Find second axis borders via per-corner template matching
 				if (analysis.XDominant && analysis.XAxis.HasCenter)
@@ -482,205 +835,100 @@ namespace Auto9Slicer
 				};
 			}
 
-			/// <summary>
-			/// Find second-axis borders using per-corner template matching on the collapsed image.
-			/// xDominant=true: borderA=left, borderB=right, scanning Y axis.
-			/// xDominant=false: borderA=bottom, borderB=top, scanning X axis.
-			/// </summary>
 			private void FindSecondAxisBorders(SliceAnalysis result, int borderA, int borderB, bool xDominant)
 			{
-				// The collapsed image axes:
-				// If X dominant: width = borderA + borderB, height = full. Scan along height.
-				// If Y dominant: height = borderA + borderB, width = full. Scan along width.
 				var scanLength = xDominant ? _height : _width;
-				var scanStride = xDominant ? _width : 1;       // step to next row or column
-				var cornerStride = xDominant ? 1 : _width;     // step within a row or column
 
-				// Corner column/row ranges in collapsed image
-				var aStart = 0;                   // left or bottom side start
-				var aEnd = borderA;               // left or bottom side end (exclusive)
-				var bStart = borderA;             // right or top side start
-				var bEnd = borderA + borderB;     // right or top side end (exclusive)
+				// Pass 1: Alpha shape — scan outer edge per row
+				var alphaStartA = AlphaScanHeight(0, borderA, 0, 1, -1);
+				var alphaStartB = AlphaScanHeight(borderA, borderA + borderB, 0, 1, 1);
+				var alphaEndA = AlphaScanHeight(0, borderA, scanLength - 1, -1, -1);
+				var alphaEndB = AlphaScanHeight(borderA, borderA + borderB, scanLength - 1, -1, 1);
 
-				// Direction A: start-side corners are reference, find end-side positions
-				var (posALeft, hALeft, normALeft) = ScanCorner(
-					aStart, aEnd, cornerStride,
-					borderA, scanStride, scanLength,
-					templateAtStart: true);
-				var (posARight, hARight, normARight) = ScanCorner(
-					bStart, bEnd, cornerStride,
-					borderB, scanStride, scanLength,
-					templateAtStart: true);
-				var normA = normALeft + normARight;
+				// Pass 2: Inner edge — luminance derivative scan
+				var (edgeStartA, edgeStartB, edgeEndA, edgeEndB) = EdgeScanBorders(result);
 
-				// Direction B: end-side corners are reference, find start-side positions
-				var (posBLeft, hBLeft, normBLeft) = ScanCorner(
-					aStart, aEnd, cornerStride,
-					borderA, scanStride, scanLength,
-					templateAtStart: false);
-				var (posBRight, hBRight, normBRight) = ScanCorner(
-					bStart, bEnd, cornerStride,
-					borderB, scanStride, scanLength,
-					templateAtStart: false);
-				var normB = normBLeft + normBRight;
+				// Store debug
+				result.AlphaStartA = alphaStartA;
+				result.AlphaStartB = alphaStartB;
+				result.AlphaEndA = alphaEndA;
+				result.AlphaEndB = alphaEndB;
+				result.EdgeStartA = edgeStartA;
+				result.EdgeStartB = edgeStartB;
+				result.EdgeEndA = edgeEndA;
+				result.EdgeEndB = edgeEndB;
 
-				result.ScoreA = normA;
-				result.ScoreALeft = normALeft;
-				result.ScoreARight = normARight;
-				result.HeightALeft = hALeft;
-				result.HeightARight = hARight;
-				result.ScoreB = normB;
-				result.ScoreBLeft = normBLeft;
-				result.ScoreBRight = normBRight;
-				result.HeightBLeft = hBLeft;
-				result.HeightBRight = hBRight;
-				result.DirectionAWon = normA <= normB;
+				// Combine: max of both passes
+				result.HeightStartA = Mathf.Max(alphaStartA, edgeStartA);
+				result.HeightStartB = Mathf.Max(alphaStartB, edgeStartB);
+				result.HeightEndA = Mathf.Max(alphaEndA, edgeEndA);
+				result.HeightEndB = Mathf.Max(alphaEndB, edgeEndB);
 
-				int secondStart, secondEnd;
-				if (result.DirectionAWon)
+				var secondStart = Mathf.Max(result.HeightStartA, result.HeightStartB);
+				var secondEnd = Mathf.Max(result.HeightEndA, result.HeightEndB);
+
+				// Clamp if top + bottom overlap
+				if (secondStart + secondEnd > scanLength)
 				{
-					// Start-side is reference
-					secondStart = Mathf.Max(hALeft, hARight);
-					var endFromA = scanLength - posALeft;
-					var endFromB = scanLength - posARight;
-					secondEnd = Mathf.Max(endFromA, endFromB);
-				}
-				else
-				{
-					// End-side is reference
-					secondEnd = Mathf.Max(hBLeft, hBRight);
-					var startFromA = posBLeft + hBLeft;
-					var startFromB = posBRight + hBRight;
-					secondStart = Mathf.Max(startFromA, startFromB);
+					secondStart = scanLength / 2;
+					secondEnd = scanLength / 2;
 				}
 
-				result.SecondAxisStart = secondStart;
-				result.SecondAxisEnd = secondEnd;
-
-				// Compose final border
-				// secondStart = border at start of second axis (bottom if X dom, left if Y dom)
-				// secondEnd   = border at end of second axis (top if X dom, right if Y dom)
 				if (xDominant)
-				{
-					result.FinalBorder = new Border(
-						left: borderA,
-						bottom: secondStart,
-						right: borderB,
-						top: secondEnd);
-				}
+					result.FinalBorder = new Border(borderA, secondStart, borderB, secondEnd);
 				else
-				{
-					result.FinalBorder = new Border(
-						left: secondStart,
-						bottom: borderA,
-						right: secondEnd,
-						top: borderB);
-				}
+					result.FinalBorder = new Border(secondStart, borderA, secondEnd, borderB);
 			}
 
-			private (int, int, double) ScanCorner(
-				int colStart, int colEnd, int colStride,
-				int nominalHeight, int lineStride, int totalLines,
-				bool templateAtStart)
+			/// <summary>
+			/// Pass 1: Alpha scan on the outer edge.
+			/// For each row, find the outermost fg pixel. Track the row whose fg pixel
+			/// is closest to the image edge. Among ties, pick the shallowest row.
+			/// scanOutward: -1 for left side, +1 for right side.
+			/// </summary>
+			private int AlphaScanHeight(int colStart, int colEnd, int startRow, int dir, int scanOutward)
 			{
-				var bruteForce = _cornerMode == CornerMatchMode.AlphaBruteForce ||
-				                 _cornerMode == CornerMatchMode.ColorBruteForce;
-				var alphaOnly = _cornerMode == CornerMatchMode.AlphaFixedHeight ||
-				                _cornerMode == CornerMatchMode.AlphaBruteForce;
+				var edgeCol = scanOutward < 0 ? colStart : colEnd - 1;
+				var bestCol = scanOutward < 0 ? colEnd : colStart - 1; // worst possible
+				var bestH = 0;
 
-				var bestNormScore = double.MaxValue;
-				var bestPos = templateAtStart ? totalLines - nominalHeight : 0;
-				var bestHeight = nominalHeight;
-				var pixelWidth = colEnd - colStart;
-
-				var hMin = bruteForce ? Mathf.Max(2, nominalHeight / 2) : nominalHeight;
-				var hMax = bruteForce ? Mathf.Min(nominalHeight * 3, totalLines / 2) : nominalHeight;
-
-				for (var h = hMin; h <= hMax; h++)
+				for (var i = 0; i < _height; i++)
 				{
-					var templateStart = templateAtStart ? 0 : totalLines - h;
+					var row = startRow + i * dir;
+					if (row < 0 || row >= _height) break;
 
-					int scanMin, scanMax;
-					if (templateAtStart)
+					var foundCol = -1;
+					if (scanOutward < 0)
 					{
-						scanMin = h;
-						scanMax = totalLines - h;
+						for (var col = colStart; col < colEnd; col++)
+						{
+							if (_pixels[row * _width + col].a >= _maxAlpha)
+							{ foundCol = col; break; }
+						}
+						if (foundCol >= 0 && foundCol < bestCol)
+						{
+							bestCol = foundCol;
+							bestH = i + 1;
+							if (bestCol == edgeCol) return i == 0 ? 0 : bestH;
+						}
 					}
 					else
 					{
-						scanMin = 0;
-						scanMax = totalLines - 2 * h;
-					}
-
-					for (var scanPos = scanMin; scanPos <= scanMax; scanPos++)
-					{
-						var rawScore = alphaOnly
-							? CompareFlippedAlpha(colStart, colEnd, colStride,
-								templateStart, scanPos, h, lineStride)
-							: CompareFlippedColor(colStart, colEnd, colStride,
-								templateStart, scanPos, h, lineStride);
-
-						var normScore = (double)rawScore / (pixelWidth * h);
-
-						if (normScore < bestNormScore)
+						for (var col = colEnd - 1; col >= colStart; col--)
 						{
-							bestNormScore = normScore;
-							bestPos = scanPos;
-							bestHeight = h;
+							if (_pixels[row * _width + col].a >= _maxAlpha)
+							{ foundCol = col; break; }
+						}
+						if (foundCol >= 0 && foundCol > bestCol)
+						{
+							bestCol = foundCol;
+							bestH = i + 1;
+							if (bestCol == edgeCol) return i == 0 ? 0 : bestH;
 						}
 					}
 				}
 
-				return (bestPos, bestHeight, bestNormScore);
-			}
-
-			private ulong CompareFlippedAlpha(
-				int colStart, int colEnd, int colStride,
-				int srcLineStart, int dstLineStart, int lineCount, int lineStride)
-			{
-				ulong score = 0;
-				for (var line = 0; line < lineCount; line++)
-				{
-					var srcLine = srcLineStart + line;
-					var dstLine = dstLineStart + (lineCount - 1 - line);
-					var srcBase = srcLine * lineStride;
-					var dstBase = dstLine * lineStride;
-
-					for (var col = colStart; col < colEnd; col++)
-					{
-						var srcIdx = srcBase + col * colStride;
-						var dstIdx = dstBase + col * colStride;
-						score += (ulong)Mathf.Abs(_pixels[srcIdx].a - _pixels[dstIdx].a);
-					}
-				}
-
-				return score;
-			}
-
-			private ulong CompareFlippedColor(
-				int colStart, int colEnd, int colStride,
-				int srcLineStart, int dstLineStart, int lineCount, int lineStride)
-			{
-				ulong score = 0;
-				for (var line = 0; line < lineCount; line++)
-				{
-					var srcLine = srcLineStart + line;
-					var dstLine = dstLineStart + (lineCount - 1 - line);
-					var srcBase = srcLine * lineStride;
-					var dstBase = dstLine * lineStride;
-
-					for (var col = colStart; col < colEnd; col++)
-					{
-						var srcIdx = srcBase + col * colStride;
-						var dstIdx = dstBase + col * colStride;
-						var a = _pixels[srcIdx];
-						var b = _pixels[dstIdx];
-						score += (ulong)(Mathf.Abs(a.r - b.r) + Mathf.Abs(a.g - b.g) +
-						                 Mathf.Abs(a.b - b.b) + Mathf.Abs(a.a - b.a));
-					}
-				}
-
-				return score;
+				return bestH;
 			}
 
 			private void CollapseX(int centerStart, int centerEnd)
@@ -725,6 +973,22 @@ namespace Auto9Slicer
 			{
 				var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
 				tex.SetPixels32(pixels);
+				tex.Apply();
+				return tex;
+			}
+
+			private static Texture2D CreateLuminanceTexture(Color32[] pixels, int width, int height)
+			{
+				var lumPixels = new Color32[pixels.Length];
+				for (var i = 0; i < pixels.Length; i++)
+				{
+					var p = pixels[i];
+					var lum = (byte)((299 * p.r + 587 * p.g + 114 * p.b) / 1000);
+					lumPixels[i] = new Color32(lum, lum, lum, p.a);
+				}
+
+				var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+				tex.SetPixels32(lumPixels);
 				tex.Apply();
 				return tex;
 			}
